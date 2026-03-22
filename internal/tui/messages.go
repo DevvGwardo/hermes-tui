@@ -7,6 +7,7 @@ import (
 
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // MsgRole identifies the sender of a message.
@@ -146,7 +147,7 @@ func renderAssistantMessage(msg ChatMsg, theme Theme, width int) string {
 			lines := strings.Split(content, "\n")
 			for i, l := range lines {
 				if lipgloss.Width(l) > contentWidth {
-					lines[i] = l[:contentWidth]
+					lines[i] = ansi.Truncate(l, contentWidth, "")
 				}
 			}
 			content = strings.Join(lines, "\n")

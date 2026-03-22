@@ -6,8 +6,8 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/hermes-ai/hermes-tui/internal/config"
-	"github.com/hermes-ai/hermes-tui/internal/gateway"
+	"github.com/DevvGwardo/hermes-tui/internal/config"
+	"github.com/DevvGwardo/hermes-tui/internal/gateway"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -18,6 +18,24 @@ type (
 	SendResultMsg   struct{ Err error }
 	StatusResultMsg struct{ Content string; Err error }
 	ThinkResultMsg  struct{ Content string }
+
+	// SessionsLoadedMsg is returned after listing sessions and fetching history.
+	SessionsLoadedMsg struct {
+		SessionKey string
+		Model      string
+		History    []gateway.Message
+	}
+
+	// AssistantResponseMsg is returned after the gateway processes a message.
+	AssistantResponseMsg struct {
+		Content    string
+		SessionKey string
+	}
+
+	// MessageStreamErrorMsg is returned when the gateway reports an error during message processing.
+	MessageStreamErrorMsg struct {
+		Content string
+	}
 )
 
 // Model is the main Bubble Tea model.
@@ -37,7 +55,6 @@ type Model struct {
 	connected   bool
 	streaming   bool
 	streamBuf   string
-	ctrlCCount  int
 	lastCtrlC   time.Time
 	quitting    bool
 	thinking    bool
@@ -125,7 +142,62 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				Content:   fmt.Sprintf("Failed to send: %v", msg.Err),
 				Timestamp: time.Now(),
 			})
+			m.streaming = false
 		}
+		return m, nil
+
+	case SessionsLoadedMsg:
+		if msg.SessionKey != "" {
+			m.sessionKey = msg.SessionKey
+			m.statusBar.SetSession(msg.SessionKey)
+			m.header.SetSession(msg.SessionKey)
+		}
+		if msg.Model != "" {
+			m.statusBar.SetModel(msg.Model)
+		}
+		m.chat.AddMessage(ChatMsg{
+			Role:      RoleSystem,
+			Content:   fmt.Sprintf("Session: %s | Model: %s", msg.SessionKey, msg.Model),
+			Timestamp: time.Now(),
+		})
+		for _, histMsg := range msg.History {
+			role := RoleAssistant
+			if histMsg.Role == "user" {
+				role = RoleUser
+			}
+			m.chat.AddMessage(ChatMsg{
+				Role:      role,
+				Content:   histMsg.Content,
+				Timestamp: time.Now(),
+			})
+		}
+		m.statusBar.SetMessageCount(len(m.chat.GetMessages()))
+		return m, nil
+
+	case AssistantResponseMsg:
+		if msg.SessionKey != "" && m.sessionKey == "" {
+			m.sessionKey = msg.SessionKey
+			m.statusBar.SetSession(msg.SessionKey)
+			m.header.SetSession(msg.SessionKey)
+		}
+		if msg.Content != "" {
+			m.chat.AddMessage(ChatMsg{
+				Role:      RoleAssistant,
+				Content:   msg.Content,
+				Timestamp: time.Now(),
+			})
+		}
+		m.statusBar.SetMessageCount(len(m.chat.GetMessages()))
+		m.streaming = false
+		return m, nil
+
+	case MessageStreamErrorMsg:
+		m.chat.AddMessage(ChatMsg{
+			Role:      RoleError,
+			Content:   msg.Content,
+			Timestamp: time.Now(),
+		})
+		m.streaming = false
 		return m, nil
 
 	case tea.KeyMsg:
@@ -156,7 +228,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		m.lastCtrlC = now
-		m.ctrlCCount++
 		if m.input.Value() != "" {
 			m.input.Reset()
 			return m, nil
@@ -206,6 +277,7 @@ func (m Model) handleSubmit() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.input.Reset()
+	m.streaming = true
 
 	m.chat.AddMessage(ChatMsg{
 		Role:      RoleUser,
@@ -217,98 +289,84 @@ func (m Model) handleSubmit() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) sendMessageCmd(text string) tea.Cmd {
+	gw := m.gateway
+	sessionKey := m.sessionKey
 	return func() tea.Msg {
-		if m.sessionKey == "" {
-			// Try to get or create a session
-			sessions, err := m.gateway.ListSessions()
+		// Resolve session if needed
+		if sessionKey == "" {
+			sessions, err := gw.ListSessions()
 			if err != nil || len(sessions) == 0 {
 				return SendResultMsg{Err: fmt.Errorf("no active sessions")}
 			}
-			m.sessionKey = sessions[0].Key
-			m.statusBar.SetSession(m.sessionKey)
-			m.header.SetSession(m.sessionKey)
+			sessionKey = sessions[0].Key
 		}
 
-		ch, err := m.gateway.SendMessage(m.sessionKey, text)
+		ch, err := gw.SendMessage(sessionKey, text)
 		if err != nil {
 			return SendResultMsg{Err: err}
 		}
-		// Process chunks
-		go func() {
-			for chunk := range ch {
-				if strings.HasPrefix(chunk, "[error]") {
-					m.chat.AddMessage(ChatMsg{
-						Role:      RoleError,
-						Content:   strings.TrimPrefix(chunk, "[error] "),
-						Timestamp: time.Now(),
-					})
-					return
+
+		// Drain the channel (blocks until gateway is done)
+		for chunk := range ch {
+			if strings.HasPrefix(chunk, "[error]") {
+				return MessageStreamErrorMsg{
+					Content: strings.TrimPrefix(chunk, "[error] "),
 				}
 			}
-			// Response complete — fetch history to get the assistant message
-			msgs, err := m.gateway.GetSessionHistory(m.sessionKey, 5)
-			if err == nil && len(msgs) > 0 {
-				// Find last assistant message
-				var lastAssistant string
-				for i := len(msgs) - 1; i >= 0; i-- {
-					if msgs[i].Role == "assistant" {
-						lastAssistant = msgs[i].Content
-						break
-					}
-				}
-				if lastAssistant != "" {
-					m.chat.AddMessage(ChatMsg{
-						Role:      RoleAssistant,
-						Content:   lastAssistant,
-						Timestamp: time.Now(),
-					})
-				}
+		}
+
+		// Fetch history to get the assistant response
+		msgs, err := gw.GetSessionHistory(sessionKey, 5)
+		if err != nil {
+			return SendResultMsg{Err: fmt.Errorf("fetch response: %w", err)}
+		}
+
+		var lastAssistant string
+		for i := len(msgs) - 1; i >= 0; i-- {
+			if msgs[i].Role == "assistant" {
+				lastAssistant = msgs[i].Content
+				break
 			}
-			m.statusBar.SetMessageCount(len(m.chat.GetMessages()))
-		}()
-		return SendResultMsg{}
+		}
+
+		return AssistantResponseMsg{
+			Content:    lastAssistant,
+			SessionKey: sessionKey,
+		}
 	}
 }
 
 func (m Model) loadSessionsCmd() tea.Cmd {
+	gw := m.gateway
+	currentSessionKey := m.sessionKey
 	return func() tea.Msg {
-		sessions, err := m.gateway.ListSessions()
+		sessions, err := gw.ListSessions()
 		if err != nil {
 			return StatusResultMsg{Err: fmt.Errorf("list sessions: %w", err)}
 		}
-		if len(sessions) > 0 {
-			if m.sessionKey == "" {
-				m.sessionKey = sessions[0].Key
-			}
-			model := sessions[0].Model
-			if model != "" {
-				m.statusBar.SetModel(model)
-			}
-			m.statusBar.SetSession(m.sessionKey)
-			m.header.SetSession(m.sessionKey)
-			m.chat.AddMessage(ChatMsg{
-				Role:      RoleSystem,
-				Content:   fmt.Sprintf("Session: %s | Model: %s", m.sessionKey, model),
-				Timestamp: time.Now(),
-			})
-			// Load history
-			msgs, err := m.gateway.GetSessionHistory(m.sessionKey, 50)
-			if err == nil {
-				for _, msg := range msgs {
-					role := RoleAssistant
-					if msg.Role == "user" {
-						role = RoleUser
-					}
-					m.chat.AddMessage(ChatMsg{
-						Role:      role,
-						Content:   msg.Content,
-						Timestamp: time.Now(),
-					})
-				}
-				m.statusBar.SetMessageCount(len(m.chat.GetMessages()))
-			}
+		if len(sessions) == 0 {
+			return StatusResultMsg{Content: "No active sessions found."}
 		}
-		return StatusResultMsg{}
+
+		resolvedKey := currentSessionKey
+		if resolvedKey == "" {
+			resolvedKey = sessions[0].Key
+		}
+
+		modelName := sessions[0].Model
+
+		// Pre-fetch history
+		var history []gateway.Message
+		msgs, err := gw.GetSessionHistory(resolvedKey, 50)
+		if err == nil {
+			history = msgs
+		}
+
+		return SessionsLoadedMsg{
+			SessionKey: resolvedKey,
+			Model:      modelName,
+			History:    history,
+		}
 	}
 }
 

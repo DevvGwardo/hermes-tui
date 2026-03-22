@@ -228,7 +228,11 @@ func (c *Client) GetSessionHistory(sessionKey string, limit int) ([]Message, err
 	return []Message{}, nil
 }
 
-// SendMessage sends a message to a session. It returns a channel of response chunks.
+// SendMessage sends a message to a session. It returns a channel that signals
+// completion. Note: this does not stream individual tokens. The channel will
+// either close cleanly (indicating the gateway processed the message) or
+// emit a single "[error] ..." string. After the channel closes, callers
+// should use GetSessionHistory to retrieve the assistant's response.
 func (c *Client) SendMessage(sessionKey, content string) (<-chan string, error) {
 	idempotencyKey := uuid.New().String()
 	ch := make(chan string, 64)

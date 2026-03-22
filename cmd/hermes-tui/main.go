@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/hermes-ai/hermes-tui/internal/config"
-	"github.com/hermes-ai/hermes-tui/internal/gateway"
-	"github.com/hermes-ai/hermes-tui/internal/tui"
+	"github.com/DevvGwardo/hermes-tui/internal/config"
+	"github.com/DevvGwardo/hermes-tui/internal/gateway"
+	"github.com/DevvGwardo/hermes-tui/internal/tui"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -41,7 +41,7 @@ func main() {
 
 	// Run TUI
 	model := tui.NewModel(gw, cfg.SessionID, cfg.Theme, cfg)
-	if _, err := tea.NewProgram(model).Run(); err != nil {
+	if _, err := tea.NewProgram(model, tea.WithAltScreen()).Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}

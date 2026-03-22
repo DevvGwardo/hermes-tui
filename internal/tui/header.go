@@ -86,13 +86,8 @@ func (h HeaderModel) View() string {
 		line += strings.Repeat(" ", padding)
 	}
 
-	bgStyle := lipgloss.NewStyle().
-		Background(p.HeaderBg).
-		Width(h.width).
-		Render(line)
-
 	return lipgloss.NewStyle().
 		Background(p.HeaderBg).
 		Width(h.width).
-		Render(bgStyle)
+		Render(line)
 }
