@@ -306,7 +306,7 @@ func (m Model) sendMessageCmd(text string) tea.Cmd {
 			return SendResultMsg{Err: err}
 		}
 
-		// Drain the channel (blocks until gateway is done)
+		// Drain the channel (blocks until gateway acknowledges)
 		for chunk := range ch {
 			if strings.HasPrefix(chunk, "[error]") {
 				return MessageStreamErrorMsg{
@@ -315,24 +315,40 @@ func (m Model) sendMessageCmd(text string) tea.Cmd {
 			}
 		}
 
-		// Fetch history to get the assistant response
-		msgs, err := gw.GetSessionHistory(sessionKey, 5)
-		if err != nil {
-			return SendResultMsg{Err: fmt.Errorf("fetch response: %w", err)}
-		}
+		// The gateway's chat.send is fire-and-forget — it returns before the
+		// AI has finished processing. Poll history until the assistant responds.
+		const maxAttempts = 60
+		pollInterval := 1 * time.Second
 
-		var lastAssistant string
-		for i := len(msgs) - 1; i >= 0; i-- {
-			if msgs[i].Role == "assistant" {
-				lastAssistant = msgs[i].Content
-				break
+		for attempt := 0; attempt < maxAttempts; attempt++ {
+			time.Sleep(pollInterval)
+
+			msgs, err := gw.GetSessionHistory(sessionKey, 5)
+			if err != nil {
+				continue
+			}
+
+			// Look for an assistant message as the last entry
+			for i := len(msgs) - 1; i >= 0; i-- {
+				if msgs[i].Role == "assistant" && msgs[i].Content != "" {
+					return AssistantResponseMsg{
+						Content:    msgs[i].Content,
+						SessionKey: sessionKey,
+					}
+				}
+				// If we hit a user message first, the assistant hasn't replied yet
+				if msgs[i].Role == "user" {
+					break
+				}
+			}
+
+			// Back off slightly after initial fast polls
+			if attempt == 5 {
+				pollInterval = 2 * time.Second
 			}
 		}
 
-		return AssistantResponseMsg{
-			Content:    lastAssistant,
-			SessionKey: sessionKey,
-		}
+		return SendResultMsg{Err: fmt.Errorf("timed out waiting for response")}
 	}
 }
 
