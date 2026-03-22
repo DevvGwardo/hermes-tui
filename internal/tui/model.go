@@ -294,61 +294,26 @@ func (m Model) sendMessageCmd(text string) tea.Cmd {
 	return func() tea.Msg {
 		// Resolve session if needed
 		if sessionKey == "" {
-			sessions, err := gw.ListSessions()
-			if err != nil || len(sessions) == 0 {
+			sessions, err := gw.ListSessionsWS()
+			if err != nil {
+				return SendResultMsg{Err: fmt.Errorf("no active sessions: %w", err)}
+			}
+			if len(sessions) == 0 {
 				return SendResultMsg{Err: fmt.Errorf("no active sessions")}
 			}
 			sessionKey = sessions[0].Key
 		}
 
-		ch, err := gw.SendMessage(sessionKey, text)
+		// Send via WebSocket and wait for the full response
+		result, err := gw.SendChatWS(sessionKey, text)
 		if err != nil {
 			return SendResultMsg{Err: err}
 		}
 
-		// Drain the channel (blocks until gateway acknowledges)
-		for chunk := range ch {
-			if strings.HasPrefix(chunk, "[error]") {
-				return MessageStreamErrorMsg{
-					Content: strings.TrimPrefix(chunk, "[error] "),
-				}
-			}
+		return AssistantResponseMsg{
+			Content:    result.Content,
+			SessionKey: sessionKey,
 		}
-
-		// The gateway's chat.send is fire-and-forget — it returns before the
-		// AI has finished processing. Poll history until the assistant responds.
-		const maxAttempts = 60
-		pollInterval := 1 * time.Second
-
-		for attempt := 0; attempt < maxAttempts; attempt++ {
-			time.Sleep(pollInterval)
-
-			msgs, err := gw.GetSessionHistory(sessionKey, 5)
-			if err != nil {
-				continue
-			}
-
-			// Look for an assistant message as the last entry
-			for i := len(msgs) - 1; i >= 0; i-- {
-				if msgs[i].Role == "assistant" && msgs[i].Content != "" {
-					return AssistantResponseMsg{
-						Content:    msgs[i].Content,
-						SessionKey: sessionKey,
-					}
-				}
-				// If we hit a user message first, the assistant hasn't replied yet
-				if msgs[i].Role == "user" {
-					break
-				}
-			}
-
-			// Back off slightly after initial fast polls
-			if attempt == 5 {
-				pollInterval = 2 * time.Second
-			}
-		}
-
-		return SendResultMsg{Err: fmt.Errorf("timed out waiting for response")}
 	}
 }
 
@@ -356,7 +321,7 @@ func (m Model) loadSessionsCmd() tea.Cmd {
 	gw := m.gateway
 	currentSessionKey := m.sessionKey
 	return func() tea.Msg {
-		sessions, err := gw.ListSessions()
+		sessions, err := gw.ListSessionsWS()
 		if err != nil {
 			return StatusResultMsg{Err: fmt.Errorf("list sessions: %w", err)}
 		}
@@ -371,9 +336,9 @@ func (m Model) loadSessionsCmd() tea.Cmd {
 
 		modelName := sessions[0].Model
 
-		// Pre-fetch history
+		// Pre-fetch history via WebSocket
 		var history []gateway.Message
-		msgs, err := gw.GetSessionHistory(resolvedKey, 50)
+		msgs, err := gw.GetSessionHistoryWS(resolvedKey, 50)
 		if err == nil {
 			history = msgs
 		}
